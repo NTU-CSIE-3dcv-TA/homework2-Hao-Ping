@@ -142,101 +142,139 @@ def _make_frustum_lineset(T_wc, scale=0.5):
     return ls
 
 def visualization(Camera2World_Transform_Matrixs, points3D_df):
-    import open3d as o3d
     import numpy as np
+    import open3d as o3d
 
-    geoms = []
-
-    # === 1) 建立點雲 (XYZ + RGB) ===
-    # 位置
+    # ---------- 準備點雲（含 RGB） ----------
     if "XYZ" in points3D_df.columns:
-        pts = np.vstack(points3D_df["XYZ"].to_list()).astype(np.float64)   # (N,3)
+        pts = np.vstack(points3D_df["XYZ"].to_list()).astype(np.float32)
     else:
-        pts = points3D_df[["X","Y","Z"]].values.astype(np.float64)
-
+        pts = points3D_df[["X","Y","Z"]].values.astype(np.float32)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
 
-    # 顏色（支援兩種欄位型式）
     if "RGB" in points3D_df.columns:
-        rgb = np.vstack(points3D_df["RGB"].to_list()).astype(np.float32)   # (N,3), 0~255
-    elif set(["R","G","B"]).issubset(points3D_df.columns):
-        rgb = points3D_df[["R","G","B"]].values.astype(np.float32)         # (N,3), 0~255
+        rgb = np.vstack(points3D_df["RGB"].to_list()).astype(np.float32) / 255.0
+    elif {"R","G","B"}.issubset(points3D_df.columns):
+        rgb = points3D_df[["R","G","B"]].values.astype(np.float32) / 255.0
     else:
-        # 沒有顏色就給個預設淡藍
-        rgb = np.tile(np.array([[120, 180, 255]], dtype=np.float32), (pts.shape[0], 1))
+        rgb = np.tile(np.array([[0.47, 0.71, 1.0]], dtype=np.float32), (pts.shape[0], 1))
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(rgb, 0, 1))
 
-    rgb = np.clip(rgb / 255.0, 0.0, 1.0)                                   # 轉 0~1
-    pcd.colors = o3d.utility.Vector3dVector(rgb)
+    mins = pts.min(axis=0); maxs = pts.max(axis=0)
+    scene_diag = float(np.linalg.norm(maxs - mins))
+    cam_size = 0.02 * scene_diag if scene_diag > 0 else 0.2
 
-    # （可選）估計法向量：對點雲上色不是必須，但後續想做法向可視化或濾波會用到
-    # pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
-
-    geoms.append(pcd)
-
-    # === 2) 相機四角錐 + 軌跡 ===
-    def _make_frustum_lineset(T_wc, size=0.2, color=(1.0, 0.0, 0.0)):
-        """
-        等比例縮放的相機四角錐（+Z 朝前）
-        - size: 全尺寸尺度（同時影響 XY與Z）
-        """
-        import numpy as np
-        import open3d as o3d
-
-        half = 0.5 * size    # 底面半寬（等比）
-        depth = 1.0 * size   # 錐體深度（等比）
-
-        C = np.array([0,    0,     0,    1.0])
-        a = np.array([ half, half, depth, 1.0])
-        b = np.array([ half,-half, depth, 1.0])
-        c = np.array([-half,-half, depth, 1.0])
-        d = np.array([-half, half, depth, 1.0])
-
-        pts_cam = np.stack([C, a, b, c, d], axis=0).T  # 4x5
+    # ---------- 幫每個相機建立外框 + 半透明底面 ----------
+    def make_frustum_lines_and_base(T_wc, size=cam_size,
+                                    line_color=(1.0,0.0,0.0),
+                                    base_rgba=(1.0,0.0,0.0,0.3)):
+        half, depth = 0.5*size, 1.0*size
+        C = np.array([0,0,0,1.0])
+        a = np.array([ half,  half,  depth, 1.0])  # +Z 朝前
+        b = np.array([ half, -half,  depth, 1.0])
+        c = np.array([-half, -half,  depth, 1.0])
+        d = np.array([-half,  half,  depth, 1.0])
+        pts_cam = np.stack([C,a,b,c,d], axis=0).T
         pts_world = (T_wc @ pts_cam).T[:, :3]
-        lines = [[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]]
 
+        # 線框
+        lines = [[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]]
         ls = o3d.geometry.LineSet()
         ls.points = o3d.utility.Vector3dVector(pts_world)
         ls.lines  = o3d.utility.Vector2iVector(lines)
         ls.colors = o3d.utility.Vector3dVector(
-            np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
+            np.tile(np.array(line_color, dtype=np.float32), (len(lines),1))
         )
-        return ls
+        mat_line = o3d.visualization.rendering.MaterialRecord()
+        mat_line.shader = "unlitLine"
+        mat_line.line_width = 1.5
 
+        # 底面 mesh（兩個三角形）
+        base_pts = pts_world[1:]  # a,b,c,d
+        base = o3d.geometry.TriangleMesh()
+        base.vertices  = o3d.utility.Vector3dVector(base_pts)
+        base.triangles = o3d.utility.Vector3iVector(np.array([[0,1,2],[0,2,3]], dtype=np.int32))
+        base.compute_vertex_normals()
 
+        mat_base = o3d.visualization.rendering.MaterialRecord()
+        mat_base.shader = "defaultLitTransparency"   # 支援 alpha
+        r,g,b,a = base_rgba
+        mat_base.base_color = [float(r), float(g), float(b), float(a)]
 
-    traj_xyz = []
-    for T in Camera2World_Transform_Matrixs:
-        # 四角錐：用預設 scale=0.3、紅色
-        geoms.append(_make_frustum_lineset(T, size=0.1, color=(1.0, 0.0, 0.0)))
-        traj_xyz.append(T[:3, 3])
+        return ls, mat_line, base, mat_base
 
-    if len(traj_xyz) >= 2:
-        import numpy as np
-        traj = o3d.geometry.LineSet()
-        traj_pts = np.array(traj_xyz, dtype=np.float64)
-        traj.points = o3d.utility.Vector3dVector(traj_pts)
-        traj.lines  = o3d.utility.Vector2iVector([[i, i+1] for i in range(len(traj_pts)-1)])
-        # 軌跡著色為藍色
+    # 軌跡
+    traj_pts = []
+    traj_lines = []
+    for i, T in enumerate(Camera2World_Transform_Matrixs):
+        if i+1 < len(Camera2World_Transform_Matrixs):
+            traj_lines.append([i, i+1])
+        traj_pts.append(T[:3,3])
+    traj = o3d.geometry.LineSet()
+    if len(traj_pts) >= 2:
+        traj.points = o3d.utility.Vector3dVector(np.asarray(traj_pts))
+        traj.lines  = o3d.utility.Vector2iVector(np.asarray(traj_lines, dtype=np.int32))
         traj.colors = o3d.utility.Vector3dVector(
-            np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float64), (len(traj.lines), 1))
+            np.tile(np.array([[0.0,0.0,1.0]], dtype=np.float32), (len(traj_lines),1))
         )
-        geoms.append(traj)
+    mat_traj = o3d.visualization.rendering.MaterialRecord()
+    mat_traj.shader = "unlitLine"
+    mat_traj.line_width = 2.0
 
-    # === 3) 用 Visualizer 調參：點大小、背景顏色、顯示座標軸 ===
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="Relocalization: RGB Point Cloud + Camera Poses", width=1280, height=800)
-    for g in geoms:
-        vis.add_geometry(g)
+    # ---------- 優先使用 O3DVisualizer（支援透明）。失敗就 fallback ----------
+    try:
+        from open3d.visualization import gui
+        # 1) 初始化 GUI
+        gui.Application.instance.initialize()
 
-    opt = vis.get_render_option()
-    opt.background_color = np.array([1.0, 1.0, 1.0])  # 白色背景
-    opt.point_size = 2.0  # 白底上點太粗會糊，略調小
-    opt.show_coordinate_frame = True
+        # 2) 建視窗（渲染管線）
+        vis = o3d.visualization.O3DVisualizer("Relocalization (transparent base)", 1280, 800)
+        vis.show_settings = False
+        vis.show_skybox(False)
 
-    vis.run()
-    vis.destroy_window()
+        # 點雲材質
+        mat_pcd = o3d.visualization.rendering.MaterialRecord()
+        mat_pcd.shader = "defaultUnlit"
+        vis.add_geometry("point_cloud", pcd, mat_pcd)
+
+        # 相機們
+        for i, T in enumerate(Camera2World_Transform_Matrixs):
+            ls, mat_line, base_mesh, mat_base = make_frustum_lines_and_base(T, 0.1)
+            vis.add_geometry(f"cam_{i:04d}_lines", ls, mat_line)
+            vis.add_geometry(f"cam_{i:04d}_base",  base_mesh, mat_base)
+
+        # 軌跡
+        if len(traj_pts) >= 2:
+            vis.add_geometry("trajectory", traj, mat_traj)
+
+        vis.reset_camera_to_default()
+
+        # 3) 顯示視窗並進入事件循環
+        gui.Application.instance.add_window(vis)
+        gui.Application.instance.run()
+    except Exception as e:
+        # 回退到 legacy：沒有透明效果，但可以至少看到結果
+        print("[Warn] O3DVisualizer not available, fallback to legacy Visualizer. Reason:", e)
+        geoms = [pcd]
+        for i, T in enumerate(Camera2World_Transform_Matrixs):
+            ls, mat_line, base_mesh, mat_base = make_frustum_lines_and_base(T)
+            # legacy 不支援材質；只加線框和不透明底面（底面會顯示實色）
+            geoms += [ls, base_mesh]
+        if len(traj_pts) >= 2:
+            geoms.append(traj)
+
+        legacy = o3d.visualization.Visualizer()
+        legacy.create_window("Relocalization (legacy, no transparency)", 1280, 800)
+        for g in geoms:
+            legacy.add_geometry(g)
+        opt = legacy.get_render_option()
+        opt.background_color = np.array([1.0, 1.0, 1.0])
+        opt.point_size = 2.0
+        opt.show_coordinate_frame = True
+        legacy.run()
+        legacy.destroy_window()
+
 
 if __name__ == "__main__":
     # 讀資料（講義與骨架都要求用 pandas 讀 pickle）:contentReference[oaicite:5]{index=5}
