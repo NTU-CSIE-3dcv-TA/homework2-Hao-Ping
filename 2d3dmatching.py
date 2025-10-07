@@ -8,6 +8,8 @@ from tqdm import tqdm
 import open3d as o3d
 import re
 import torch
+import argparse
+
 
 def frame_idx_from_name(name: str) -> int:
     # 例如 valid_img260.jpg → 260；train_img552.jpg → 552
@@ -277,6 +279,12 @@ def visualization(Camera2World_Transform_Matrixs, points3D_df):
 
 
 if __name__ == "__main__":
+    # --- CLI args ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--export_csv", type=str, default=None,
+                        help="Path to save estimated W2C poses CSV (NAME,qx,qy,qz,qw,tx,ty,tz). Only successful frames are saved.")
+    args = parser.parse_args()
+
     # 讀資料（講義與骨架都要求用 pandas 讀 pickle）:contentReference[oaicite:5]{index=5}
     images_df     = pd.read_pickle("data/images.pkl")
     train_df      = pd.read_pickle("data/train.pkl")
@@ -297,6 +305,7 @@ if __name__ == "__main__":
 
     r_list, t_list = [], []
     rot_err_list, trans_err_list = [], []
+    name_success = []  # <--- add this
 
     for _, row in tqdm(valid_df.iterrows(), total=len(valid_df)):
         idx  = int(row["IMAGE_ID"])
@@ -319,6 +328,9 @@ if __name__ == "__main__":
         q_est_xyzw = R_est.as_quat()
         t_est = tvec.reshape(3)
 
+        name_success.append(name)  # <--- add this line
+
+
         # 讀 GT：講義宣告 image.pkl 的順序是 (QW,QX,QY,QZ)，
         # 但 DataFrame 欄位是 ["QX","QY","QZ","QW"]，這樣擷取後正好是 [x,y,z,w] 可直接用。:contentReference[oaicite:6]{index=6}
         q_gt_xyzw = row[["QX","QY","QZ","QW"]].values.astype(np.float64)
@@ -337,6 +349,27 @@ if __name__ == "__main__":
     if len(rot_err_list) > 0:
         print(f"Median rotation error (deg): {np.median(rot_err_list):.3f}")
         print(f"Median translation error:    {np.median(trans_err_list):.3f}")
+
+        # --- Export estimated W2C poses to CSV (for Q2-2 AR) ---
+    if args.export_csv and len(name_success) > 0:
+        est_df = pd.DataFrame({
+            "NAME": name_success,
+            "qx":   [q[0] for q in r_list],
+            "qy":   [q[1] for q in r_list],
+            "qz":   [q[2] for q in r_list],
+            "qw":   [q[3] for q in r_list],
+            "tx":   [t[0] for t in t_list],
+            "ty":   [t[1] for t in t_list],
+            "tz":   [t[2] for t in t_list],
+        })
+        # 保險起見，依照檔名中的數字排序（與你的視覺化一致）
+        est_df["FRAME_IDX"] = est_df["NAME"].apply(frame_idx_from_name)
+        est_df = est_df.sort_values("FRAME_IDX").drop(columns=["FRAME_IDX"])
+        est_df.to_csv(args.export_csv, index=False)
+        print(f"[OK] Exported {len(est_df)} estimated poses to: {args.export_csv}")
+    elif args.export_csv:
+        print("[WARN] --export_csv was set, but no successful poses to save.")
+
     else:
         print("No successful poses estimated.")
 
