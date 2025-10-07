@@ -125,18 +125,27 @@ def _make_frustum_lineset(T_wc, scale=0.5):
 def visualization(Camera2World_Transform_Matrixs, points3D_df):
     """
     畫：3D 點雲 + 相機軌跡（四角錐）
-    Problem 2 Step 3 要求用 Open3D 顯示相機與點雲並討論。:contentReference[oaicite:4]{index=4}
+    Problem 2 Step 3 要求用 Open3D 顯示相機與點雲並討論。
     """
     geoms = []
 
-    # 點雲
+    # 點雲 with RGB colors
     if "XYZ" in points3D_df.columns:
         pts = np.vstack(points3D_df["XYZ"].to_list())
     else:
         # 若 points3D_df 已經展開 XYZx,XYZy,XYZz
         pts = points3D_df[["X","Y","Z"]].values
+    
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    
+    # Add RGB colors to the point cloud
+    if "RGB" in points3D_df.columns:
+        colors = np.vstack(points3D_df["RGB"].to_list())
+        # Normalize RGB values to [0, 1] range (assuming they are in [0, 255])
+        colors = colors.astype(np.float64) / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    
     geoms.append(pcd)
 
     # 相機四角錐 + 軌跡
