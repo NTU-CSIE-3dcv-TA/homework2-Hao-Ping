@@ -33,10 +33,7 @@ def load_validation_poses_est(csv_path: str, images_dir: Path):
     Returns only rows whose images exist in images_dir and start with 'valid_img'.
     """
     df = pd.read_csv(csv_path)
-
-    # Build case-insensitive map: 'qx' -> actual column name in CSV
     cols_lower = {c.lower(): c for c in df.columns}
-
     required_lower = {"name","qx","qy","qz","qw","tx","ty","tz"}
     missing = [k for k in required_lower if k not in cols_lower]
     if missing:
@@ -45,7 +42,6 @@ def load_validation_poses_est(csv_path: str, images_dir: Path):
             f"(got {list(df.columns)})"
         )
 
-    # Rename to canonical names used below
     rename_map = {
         cols_lower["name"]: "NAME",
         cols_lower["qx"]:   "qx",
@@ -57,8 +53,6 @@ def load_validation_poses_est(csv_path: str, images_dir: Path):
         cols_lower["tz"]:   "tz",
     }
     df = df.rename(columns=rename_map)
-
-    # Keep only validation frames that exist on disk
     df = df[df["NAME"].astype(str).str.startswith("valid_img")].copy()
     df["FRAME_IDX"] = df["NAME"].apply(frame_idx_from_name)
     df = df.sort_values("FRAME_IDX")
@@ -72,14 +66,11 @@ def load_validation_poses_est(csv_path: str, images_dir: Path):
         q_xyzw = np.array([row["qx"], row["qy"], row["qz"], row["qw"]], dtype=np.float64)
         t_w2c  = np.array([row["tx"], row["ty"], row["tz"]], dtype=np.float64)
         poses.append({"name": name, "q_xyzw": q_xyzw, "t_w2c": t_w2c})
-
     if len(poses) == 0:
         raise ValueError("No usable estimated poses found (check NAME paths and CSV rows).")
     return poses
 
-
 def load_cube_transform(npy_path):
-    # 3x4 world transform [S*R | t] saved by transform_cube.py
     T = np.load(npy_path)  # shape (3,4)
     Rw = T[:, :3]
     tw = T[:, 3]
@@ -105,39 +96,31 @@ def sample_cube_points(res=36):
 def apply_world_transform(X_unit, Rw, tw):
     return (Rw @ X_unit.T).T + tw.reshape(1,3)
 
-def painter_sort_and_project(X_world, face_ids, R_w2c, t_w2c):
-    # Camera-space depth (+Z forward)
+def painter_sort_and_project(X_world, face_ids, R_w2c, t_w2c, use_dist=True):
     X_cam = (R_w2c @ X_world.T).T + t_w2c.reshape(1,3)
     z = X_cam[:, 2]
     keep = z > 1e-6
     if not np.any(keep):
         return np.empty((0,2), np.float32), np.empty((0,3), np.uint8)
-
     X_world = X_world[keep]; face_ids = face_ids[keep]; z = z[keep]
-    order = np.argsort(-z)  # far -> near
+    order = np.argsort(-z)
     X_sorted = X_world[order]
     fid_sorted = face_ids[order]
 
     rvec, _ = cv2.Rodrigues(R_w2c)
     tvec = t_w2c.reshape(3,1)
-    img_pts, _ = cv2.projectPoints(X_sorted, rvec, tvec, K, DIST)
+    dist_coeffs = DIST if use_dist else None
+
+    img_pts, _ = cv2.projectPoints(X_sorted, rvec, tvec, K, dist_coeffs)
     img_pts = img_pts.reshape(-1,2).astype(np.float32)
 
-    face_bgr = np.array([
-        [  0,   0, 255],  # red
-        [  0, 255,   0],  # green
-        [255,   0,   0],  # blue
-        [255, 255,   0],  # cyan
-        [255,   0, 255],  # magenta
-        [  0, 255, 255],  # yellow
-    ], dtype=np.uint8)
+    face_bgr = np.array([[0,0,255],[0,255,0],[255,0,0],[255,255,0],[255,0,255],[0,255,255]], dtype=np.uint8)
     colors = face_bgr[fid_sorted]
     return img_pts, colors
 
 def main(args):
     images_dir = Path("data/frames")
 
-    # --- pick poses: estimated (CSV) or GT (images.pkl) ---
     if args.use_est:
         poses = load_validation_poses_est(args.use_est, images_dir)
         print(f"[INFO] Using ESTIMATED poses from: {args.use_est}  (#frames: {len(poses)})")
@@ -145,13 +128,9 @@ def main(args):
         poses = load_validation_poses_gt("data/images.pkl")
         print(f"[INFO] Using GROUND-TRUTH poses from data/images.pkl  (#frames: {len(poses)})")
 
-    # --- cube world transform ---
     Rw, tw = load_cube_transform(args.cube_transform)
-
-    # --- sample cube points ---
     X_unit, face_ids = sample_cube_points(res=args.res)
 
-    # --- prepare writer ---
     first = cv2.imread(str(images_dir / poses[0]["name"]))
     if first is None:
         raise FileNotFoundError(f"Cannot read first frame: {images_dir / poses[0]['name']}")
@@ -165,17 +144,13 @@ def main(args):
         if img is None:
             continue
 
-        # world cube points
         Xw = apply_world_transform(X_unit, Rw, tw)
-
-        # W2C from quat (xyzw) + t
         R_w2c = R.from_quat(p["q_xyzw"]).as_matrix()
         t_w2c = p["t_w2c"].astype(np.float64)
 
-        # painter’s algorithm
-        pts_2d, cols = painter_sort_and_project(Xw, face_ids, R_w2c, t_w2c)
+        use_dist = not args.undistorted_frames
+        pts_2d, cols = painter_sort_and_project(Xw, face_ids, R_w2c, t_w2c, use_dist=use_dist)
 
-        # draw far->near (already sorted)
         r = args.pt_radius
         for (u,v), c in zip(pts_2d, cols):
             uu = int(round(float(u))); vv = int(round(float(v)))
@@ -183,13 +158,17 @@ def main(args):
                 cv2.circle(img, (uu, vv), r, color=tuple(int(x) for x in c.tolist()),
                            thickness=-1, lineType=cv2.LINE_AA)
 
-        writer.write(img)
+        # --- repeat each frame for slow motion ---
+        for _ in range(args.slow):
+            writer.write(img)
 
     writer.release()
     print(f"[OK] Saved AR video to: {args.out}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--undistorted_frames", action="store_true",
+                    help="Frames are already undistorted; ignore camera DIST when projecting.")
     parser.add_argument("--cube_transform", type=str, default="cube_transform_mat.npy",
                         help="3x4 transform saved by transform_cube.py")
     parser.add_argument("--out", type=str, default="ar_valid.mp4", help="output mp4")
@@ -198,5 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--pt_radius", type=int, default=1, help="drawn point radius (pixels)")
     parser.add_argument("--use_est", type=str, default=None,
                         help="CSV path with estimated W2C poses (columns: NAME,qx,qy,qz,qw,tx,ty,tz)")
+    parser.add_argument("--slow", type=int, default=1,
+                        help="Repeat each frame N times for slow-motion effect (default=1)")
     args = parser.parse_args()
     main(args)
