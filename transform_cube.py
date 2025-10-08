@@ -109,7 +109,9 @@ cube_vertices = np.asarray(cube.vertices).copy()
 vis.add_geometry(cube)
 
 R_euler = np.array([0, 0, 0]).astype(float)
-t = np.array([0, 0, 0]).astype(float)
+# t = np.array([0, 0, 0]).astype(float)
+t = np.array([1.2, -1.0, 0.8])  # move cube center in world coordinates
+
 scale = 1.0
 update_cube()
 
